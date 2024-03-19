@@ -1,145 +1,207 @@
 const express = require('express');
 const app = express();
-let http = require('http').Server(app);
-let io = require('socket.io')(http);
-let kurento = require('kurento-client');
-let minimist = require('minimist');
+const http = require('http').Server(app);
+const minimist = require('minimist');
+const io = require('socket.io')(http);
+const kurento = require('kurento-client');
 
-let kurentoClient = null;
-let iceCandidateQueues = {};
-
-let argv = minimist(process.argv.slice(2), {
+const argv = minimist(process.argv.slice(2), {
     default: {
-        as_uri: 'http://localhost:3000/',
+        as_uri: 'http://localhost:3000',
         ws_uri: 'ws://localhost:8888/kurento'
     }
 });
 
-app.use(express.static('public'))
+let kurentoClient = null;
+const iceCandidateQueues = {};
 
-io.on('connection', function (socket) {
-    console.log('a user connected');
-
-    socket.on('message', function (message) {
-        console.log('Message received: ', message.event);
-
+io.on('connection', socket => {
+    console.log("Socket client created!");
+    socket.on('message', message => {
+        console.log("Received message:", message);
         switch (message.event) {
             case 'joinRoom':
-                joinRoom(socket, message.userName, message.roomName, err => {
-                    if (err) {
-                        console.log(err);
-                    }
-                });
+                joinRoom(socket, message.userName, message.roomName);
                 break;
-
             case 'receiveVideoFrom':
-                receiveVideoFrom(socket, message.userid, message.roomName, message.sdpOffer, err => {
-                    if (err) {
-                        console.log(err);
-                    }
-                });
+                receiveVideoFrom(socket, message.userid, message.roomName, message.sdpOffer);
                 break;
-
             case 'candidate':
-                addIceCandidate(socket, message.userid, message.roomName, message.candidate, err => {
-                    if (err) {
-                        console.log(err);
-                    }
-                });
+                addIceCandidate(socket, message.userid, message.roomName, message.candidate);
                 break;
         }
-
     });
 });
 
-function joinRoom(socket, username, roomname, callback) {
-    getRoom(socket, roomname, (err, myRoom) => {
-        if (err) {
-            return callback(err);
+async function joinRoom(socket, username, roomname) {
+    try {
+        const myRoom = await getRoom(socket, roomname);
+        const outgoingMedia = await myRoom.pipeline.create('WebRtcEndpoint');
+        const user = {
+            id: socket.id,
+            name: username,
+            outgoingMedia: outgoingMedia,
+            incomingMedia: {}
+        };
+
+        const icecandidateQueue = iceCandidateQueues[user.id];
+        if (icecandidateQueue) {
+            icecandidateQueue.forEach(ice => user.outgoingMedia.addIceCandidate(ice.candidate));
+            delete iceCandidateQueues[user.id];
         }
 
-        myRoom.pipeline.create('WebRtcEndpoint', (err, outgoingMedia) => {
-            if (err) {
-                return callback(err);
+        user.outgoingMedia.on('IceCandidateFound', event => {
+            if (event.candidate) {
+                socket.emit('message', {
+                    event: 'candidate',
+                    userid: user.id,
+                    candidate: event.candidate
+                });
             }
+        });
 
-            let user = {
-                id: socket.id,
-                name: username,
-                outgoingMedia: outgoingMedia,
-                incomingMedia: {}
-            }
+        socket.to(roomname).emit('message', {
+            event: 'newParticipantArrived',
+            userid: user.id,
+            username: user.name
+        });
 
-            let iceCandidateQueue = iceCandidateQueues[user.id];
-            if (iceCandidateQueue) {
-                while (iceCandidateQueue.length) {
-                    let ice = iceCandidateQueue.shift();
-                    console.error(`user: ${user.name} collect candidate for outgoing media`);
-                    user.outgoingMedia.addIceCandidate(ice.candidate);
-                }
-            }
+        const existingUsers = Object.values(myRoom.participants).filter(participant => participant.id !== user.id);
+        socket.emit('message', {
+            event: 'existingParticipants',
+            existingUsers,
+            userid: user.id
+        });
 
-            socket.to(roomname).emit('message', {
-                event: 'newParticipantArrived', 
-                userid: user.id,
-                username: user.name
+        myRoom.participants[user.id] = user;
+
+        if (existingUsers.length === 0) {
+            existingUsers.forEach(existingUser => {
+                existingUser.outgoingMedia.connect(user.incomingMedia[existingUser.id]);
             });
+        } else {
+            const initiator = existingUsers[0];
+            const initiatorIncomingMedia = initiator.incomingMedia[user.id];
+            user.outgoingMedia.connect(initiatorIncomingMedia);
+        }
+    } catch (err) {
+        console.error("Error occurred while joining room:", err);
+    }
+}
 
-            let existingUsers = [];
-            for (let i in myRoom.participants) {
-                if (myRoom.participants[i].id != user.id) {
-                    existingUsers.push({
-                        id: myRoom.participants[i].id,
-                        name: myRoom.participants[i].name
+async function getRoom(socket, roomname) {
+    let myRoom = io.sockets.adapter.rooms.get(roomname) || { length: 0 };
+
+    let numClients = myRoom.length;
+
+    if (numClients === 0) {
+        console.log("// Room created for the first user");
+        socket.join(roomname);
+        myRoom = io.sockets.adapter.rooms.get(roomname);
+
+        try {
+            await getKurentoClient();
+            myRoom.pipeline = await kurentoClient.create('MediaPipeline');
+            myRoom.participants = {};
+        } catch (err) {
+            console.error("Error occurred while creating room:", err);
+            throw err;
+        }
+
+        return myRoom;
+    } else {
+        socket.join(roomname);
+        return myRoom;
+    }
+}
+
+async function getKurentoClient() {
+    if (kurentoClient !== null)
+        return null;
+    try {
+        kurentoClient = await kurento(argv.ws_uri);
+        return null;
+    } catch (error) {
+        console.error("Error occurred while creating Kurento client:", error);
+        throw error;
+    }
+}
+
+async function receiveVideoFrom(socket, userid, roomName, sdpOffer) {
+    try {
+        const endpoint = await getEndpointForUser(socket, roomName, userid);
+        const answerSdp = await endpoint.processOffer(sdpOffer);
+
+        socket.emit('message', {
+            event: "receiveVideoAnswer",
+            senderid: userid,
+            sdpAnswer: answerSdp
+        });
+
+        endpoint.gatherCandidates(err => {
+            if (err) console.error("Error occurred while gathering candidates:", err);
+        });
+    } catch (err) {
+        console.error("Error occurred while receiving video from:", err);
+    }
+}
+
+async function getEndpointForUser(socket, roomname, senderid) {
+    const myRoom = io.sockets.adapter.rooms.get(roomname);
+    const asker = myRoom.participants[socket.id];
+    const sender = myRoom.participants[senderid];
+
+    if (asker.id === sender.id) {
+        return asker.outgoingMedia;
+    }
+
+    if (asker.incomingMedia[sender.id]) {
+        sender.outgoingMedia.connect(asker.incomingMedia[sender.id], err => {
+            if (err) throw err;
+        });
+        return asker.incomingMedia[sender.id];
+    } else {
+        try {
+            const incomingMedia = await myRoom.pipeline.create('WebRtcEndpoint');
+            asker.incomingMedia[sender.id] = incomingMedia;
+
+            const icecandidateQueue = iceCandidateQueues[sender.id];
+            if (icecandidateQueue) {
+                icecandidateQueue.forEach(ice => incomingMedia.addIceCandidate(ice.candidate));
+            }
+
+            incomingMedia.on('IceCandidateFound', event => {
+                if (event.candidate) {
+                    socket.emit('message', {
+                        event: 'candidate',
+                        userid: sender.id,
+                        candidate: event.candidate
                     });
                 }
-            }
-            socket.emit('message', {
-                event: 'existingParticipants', 
-                existingUsers: existingUsers,
-                userid: user.id
             });
 
-            myRoom.participants[user.id] = user;
-        });
-    });
-}
-
-function receiveVideoFrom(socket, userid, roomname, sdpOffer, callback) {
-    getEndpointForUser(socket, roomname, userid, (err, endpoint) => {
-        if (err) {
-            return callback(err);
+            sender.outgoingMedia.connect(incomingMedia);
+            return incomingMedia;
+        } catch (e) {
+            console.error("Error occurred while creating incoming media client:", e);
+            throw e;
         }
-
-        endpoint.processOffer(sdpOffer, (err, sdpAnswer) => {
-            if (err) {
-                return callback(err);
-            }
-
-            socket.emit('message', {
-                event: 'receiveVideoAnswer',
-                senderid: userid,
-                sdpAnswer: sdpAnswer
-            });
-
-            endpoint.gatherCandidates(err => {
-                if (err) {
-                    return callback(err);
-                }
-            });
-        });
-    })
+    }
 }
 
-function addIceCandidate(socket, senderid, roomname, iceCandidate, callback) {
-    let user = io.sockets.adapter.rooms[roomname].participants[socket.id];
+function addIceCandidate(socket, senderid, roomName, iceCandidate) {
+    const myRoom = io.sockets.adapter.rooms.get(roomName);
+    const user = myRoom ? myRoom.participants[socket.id] : null;
     if (user != null) {
-        let candidate = kurento.register.complexTypes.IceCandidate(iceCandidate);
-        if (senderid == user.id) {
+        const candidate = kurento.register.complexTypes.IceCandidate(iceCandidate);
+        if (senderid === user.id) {
             if (user.outgoingMedia) {
                 user.outgoingMedia.addIceCandidate(candidate);
             } else {
-                iceCandidateQueues[user.id].push({candidate: candidate});
+                if (!iceCandidateQueues[user.id]) {
+                    iceCandidateQueues[user.id] = [];
+                }
+                iceCandidateQueues[user.id].push({ candidate: candidate });
             }
         } else {
             if (user.incomingMedia[senderid]) {
@@ -148,103 +210,16 @@ function addIceCandidate(socket, senderid, roomname, iceCandidate, callback) {
                 if (!iceCandidateQueues[senderid]) {
                     iceCandidateQueues[senderid] = [];
                 }
-                iceCandidateQueues[senderid].push({candidate: candidate});
-            }   
-        }
-        callback(null);
-    } else {
-        callback(new Error("addIceCandidate failed"));
-    }
-}
-
-function getRoom(socket, roomname, callback) {
-    let myRoom = io.sockets.adapter.rooms[roomname] || { length: 0 };
-    let numClients = myRoom.length;
-
-    console.log(roomname, ' has ', numClients, ' clients');
-
-    if (numClients == 0) {
-        socket.join(roomname, () => {
-            myRoom = io.sockets.adapter.rooms[roomname];
-            getKurentoClient((error, kurento) => {
-                kurento.create('MediaPipeline', (err, pipeline) => {
-                    if (error) {
-                        return callback(err);
-                    }
-
-                    myRoom.pipeline = pipeline;
-                    myRoom.participants = {};
-                    callback(null, myRoom);
+                iceCandidateQueues[senderid].push({
+                    candidate: candidate
                 });
-            });
-        });
-    } else {
-        socket.join(roomname);
-        callback(null, myRoom);
-    }
-}
-
-function getEndpointForUser(socket, roomname, senderid, callback) {
-    let myRoom = io.sockets.adapter.rooms[roomname];
-    let asker = myRoom.participants[socket.id];
-    let sender = myRoom.participants[senderid];
-
-    if (asker.id === sender.id) {
-        return callback(null, asker.outgoingMedia);
-    }
-
-    if (asker.incomingMedia[sender.id]) {
-        sender.outgoingMedia.connect(asker.incomingMedia[sender.id], err => {
-            if (err) {
-                return callback(err);
             }
-            callback(null, asker.incomingMedia[sender.id]);
-        });
-    } else {
-        myRoom.pipeline.create('WebRtcEndpoint', (err, incoming) => {
-            if (err) {
-                return callback(err);
-            }
-
-            asker.incomingMedia[sender.id] = incoming;
-
-            let iceCandidateQueue = iceCandidateQueues[sender.id];
-            if (iceCandidateQueue) {
-                while (iceCandidateQueue.length) {
-                    let ice = iceCandidateQueue.shift();
-                    console.error(`user: ${sender.name} collect candidate for outgoing media`);
-                    incoming.addIceCandidate(ice.candidate);
-                }
-            }
-
-            sender.outgoingMedia.connect(incoming, err => {
-                if (err) {
-                    return callback(err);
-                }
-                callback(null, incoming);
-            });
-        });
-    }
-}
-
-function getKurentoClient(callback) {
-    if (kurentoClient !== null) {
-        return callback(null, kurentoClient);
-    }
-
-    kurento(argv.ws_uri, function (error, _kurentoClient) {
-        if (error) {
-            console.log("Could not find media server at address " + argv.ws_uri);
-            return callback("Could not find media server at address" + argv.ws_uri
-                + ". Exiting with error " + error);
         }
-
-        kurentoClient = _kurentoClient;
-        callback(null, kurentoClient);
-    });
+    }
 }
 
-http.listen(3000, function () {
-    console.log('App is listening on port 3000!');
-});
+app.use(express.static('public'));
 
+http.listen(3000, () => {
+    console.log('App is running at port 3000');
+});
